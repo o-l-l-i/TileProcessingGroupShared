@@ -1,0 +1,343 @@
+﻿// By Olli S.
+
+#pragma kernel K_Tiles
+
+
+Texture2D<float4>   SourceTexture;
+RWTexture2D<float4> ResultTexture;
+
+
+int  _KernelSize;
+
+bool _VisualizeDispatchThreadID;
+bool _VisualizeGroupID;
+bool _VisualizeGroupThreadID;
+bool _VisualizeGroupIndex;
+
+
+#define THREADS_X 32
+#define THREADS_Y 32
+
+
+// APPROACH
+
+// Image is processed as tiles using local groupshared memory.
+// groupshared is 1D, so we can't just reserve bigger 2D array (= bigger "image" tile.)
+// Instead we do it in 1D so we transfer 2D data to 1D.
+
+// This might be much more ineffective and is much more complicated than typical access of a Texture2D...
+// ...but I wanted to do this for learning purposes.
+
+// Then the processed result is copied back to a 2D texture.
+
+
+// CALCULATING PADDING
+
+// Diagram legend:
+// numbers = data in center
+// x = padding in rows and columns
+// c = corner padding
+
+// c c x x x c c
+// c c x x x c c
+// x x 6 7 8 x x
+// x x 3 4 5 x x
+// x x 0 1 2 x x
+// c c x x x c c
+// c c x x x c c
+
+// Requirements:
+// Reserve extra rows to top and bottom, padding amount.
+// Reserve extra columns to left and right, padding amount.
+// And corners too, 4.
+
+// Count the padding area pixels:
+// Center:                 (THREADS_X * THREADS_Y)      3 * 3 = 9 in center, actual data pixels.
+// padding up and down:    (THREADS_Y * padCount * 2)   2 * 3 * 2 = 12 = 2 rows of 3 width padding on top and bottom.
+// padding left and right: (THREADS_X * padCount * 2)   3 * 2 * 2 = 12 = 3 rows of 2 width padding on left and right.
+// padding width corners:  (padCount  * padCount * 4)   2 * 2 * 4 = 16 = 2 by 2, four corners.
+
+
+#define padCount 5
+
+groupshared float4 samples[ (THREADS_X*THREADS_Y) + (THREADS_Y*padCount*2) + (THREADS_X*padCount*2) + (padCount*padCount*4) ];
+
+// Above diagram's 2-padding test case indexing proof - first bottom left tile pixel index calculated below using the above logic:
+// (indexing starts from bottom left corner, last index is at top right corner.)
+// (    3     + 2 *    2    ) *    2     ) +     2    + (      0         *    2     * 2) + index) = 16
+
+
+// Index macro:
+// To simplify actual code, I wrote a macro for getting the correct index in n-padded data:
+#define GetNPID(nindex)\
+( ((THREADS_X + 2 * padCount) * padCount ) + padCount + (GroupThreadID.y * padCount * 2) + index)
+
+
+// Shorthand for total width of row and total height of a column
+#define PADDED_X (THREADS_X + padCount * 2)
+#define PADDED_Y (THREADS_Y + padCount * 2)
+
+
+[numthreads(THREADS_X, THREADS_Y, 1)]
+void K_Tiles (int3 DispatchThreadID : SV_DispatchThreadID,
+              int3 GroupThreadID : SV_GroupThreadID,
+              int3 GroupID : SV_GroupID,
+              int  GroupIndex : SV_GroupIndex)
+{
+
+    int xDim, yDim;
+    SourceTexture.GetDimensions(xDim, yDim);
+
+    // First read the image data into the local memory, using GroupIndex (pixel's index inside a group of threads)
+    int index = GroupIndex;
+
+    // Copy pixel to the groupshared memory, to the correct 1D index that takes padding into account.
+    samples[GetNPID(index)] = SourceTexture[DispatchThreadID.xy];
+
+    // ---------------------------------------------------------------------------------------------
+    // PADDING - CARDINAL DIRECTIONS
+
+    // Padding to left
+    if (GroupThreadID.x == 0) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index)-o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy - int2(o,0)];
+        }
+    }
+    // Padding to right
+    if (GroupThreadID.x == THREADS_X-1) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index)+o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy + int2(o,0)];
+        }
+    }
+    // Padding to bottom
+    if (GroupThreadID.y == 0) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index) - PADDED_X*o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy - int2(0,o)];
+        }
+    }
+    // Padding to top
+    if (GroupThreadID.y == THREADS_Y-1) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index) + PADDED_X*o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy + int2(0,o)];
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PADDING - DIAGONAL DIRECTIONS
+
+    // Corners with higher than 2 padding present another issue;
+    // Below is the top right corner visualized:
+
+    // Padding 1:
+    // 1 1
+    // * 1
+
+    // Padding 2:
+    // 2 x 2
+    // 1 1 x
+    // * 1 2
+
+    // Padding 3:
+    // 3 x x 3
+    // 2 x 2 x
+    // 1 1 x x
+    // 8 1 2 3
+
+    // If we just take diagonal path, we are going to miss pixels on the sides of the path!
+    // So at 2 and at each higher padding levels we need to also step sideways and up or down:
+
+    // 3 <---3
+    // 2 < 2 |
+    // 1 1 V V
+    // 8 1 2 3
+
+
+    // Padding to bottom left
+    if (GroupThreadID.x == 0 && GroupThreadID.y == 0) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index) - PADDED_X*o-o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy + int2(-o,-o)];
+
+            if (o > 1) {
+                // Step to right and to up
+                // At padding level 2, we step 1 unit total, one loop, at level 3, 2 units total, 2 loops
+                for(int v=1; v < o; v++) {
+                    // To right from the diagonal position
+                    idx = GetNPID(index) - (PADDED_X*o)-v;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(-v,-o)];
+                    // To up from the diagonal position
+                    idx = GetNPID(index) - (PADDED_X*v)-o;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(-o,-v)];
+                }
+            }
+        }
+    }
+    // Padding to bottom right
+    if (GroupThreadID.x == THREADS_X-1 && GroupThreadID.y == 0) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index) - PADDED_X*o+o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy + int2(o,-o)];
+
+             // Fill 2 and higher pad voids
+            if (o > 1) {
+                // Step to left and to up
+                // At padding level 2, we step 1 unit total, one loop, at level 3, 2 units total, 2 loops
+                for(int v=1; v < o; v++) {
+                    // To left from the diagonal position
+                    idx = GetNPID(index) - (PADDED_X*o)+v;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(v,-o)];
+                    // To up from the diagonal position
+                    idx = GetNPID(index) - (PADDED_X*v)+o;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(o,-v)];
+                }
+            }
+
+        }
+    }
+    // Padding to top left
+    if (GroupThreadID.x == 0 && GroupThreadID.y == THREADS_Y-1) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index) + PADDED_X*o-o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy + int2(-o,o)];
+
+            // Fill 2 and higher pad voids
+            if (o > 1) {
+                // Step to right and to down
+                // At padding level 2, we step 1 unit total, one loop, at level 3, 2 units total, 2 loops
+                for(int v=1; v < o; v++) {
+                    // To right from the diagonal position
+                    idx = GetNPID(index) + (PADDED_X*o)-v;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(-v,o)];
+                    // To down from the diagonal position
+                    idx = GetNPID(index) + (PADDED_X*v)-o;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(-o,v)];
+                }
+            }
+        }
+    }
+
+    // Padding to top right
+    if (GroupThreadID.x == THREADS_X-1 && GroupThreadID.y == THREADS_Y-1) {
+        for (int o=1; o <= padCount; o++) {
+            int idx = GetNPID(index) + PADDED_X*o+o;
+            samples[idx] = SourceTexture[DispatchThreadID.xy + int2(o,o)];
+
+            // Fill 2 and higher pad voids
+            if (o > 1) {
+                // Step to left and to down
+                // At padding level 2, we step 1 unit total, one loop, at level 3, 2 units total, 2 loops
+                for(int v=1; v < o; v++) {
+                    // To left from the diagonal position
+                    idx = GetNPID(index) + (PADDED_X*o)+v;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(v,o)];
+                    // To down from the diagonal position
+                    idx = GetNPID(index) + (PADDED_X*v)+o;
+                    samples[idx] = SourceTexture[DispatchThreadID.xy + int2(o,v)];
+                }
+            }
+        }
+    }
+
+    // Sync threads in the group.
+    GroupMemoryBarrierWithGroupSync();
+
+
+    float4 result = 0;
+
+    // ---------------------------------------------------------------------------------------------
+    // APPLY SOBEL FILTER
+
+    float4 hr = float4(0, 0, 0, 0);
+    float4 vt = float4(0, 0, 0, 0);
+    uint o = _KernelSize;
+
+    hr += samples[GetNPID(index) - PADDED_X*o-o    ] *  1.0; // Bottom left
+    hr += samples[GetNPID(index) - PADDED_X*o      ] *  0.0; // Down
+    hr += samples[GetNPID(index) - PADDED_X*o+o    ] * -1.0; // Bottom right
+    hr += samples[GetNPID(index) - o               ] *  2.0; // Left
+    hr += samples[GetNPID(index)                   ] *  0.0; // Center
+    hr += samples[GetNPID(index) + o               ] * -2.0; // Right
+    hr += samples[GetNPID(index) + PADDED_X*o-o    ] *  1.0; // Up left
+    hr += samples[GetNPID(index) + PADDED_X*o      ] *  0.0; // Up
+    hr += samples[GetNPID(index) + PADDED_X*o+o    ] * -1.0; // Up right
+
+    vt += samples[GetNPID(index) - PADDED_X*o-o    ] *  1.0;
+    vt += samples[GetNPID(index) - PADDED_X*o      ] *  2.0;
+    vt += samples[GetNPID(index) - PADDED_X*o+o    ] *  1.0;
+    vt += samples[GetNPID(index) - o               ] *  0.0;
+    vt += samples[GetNPID(index)                   ] *  0.0;
+    vt += samples[GetNPID(index) + o               ] *  0.0;
+    vt += samples[GetNPID(index) + PADDED_X*o-o    ] * -1.0;
+    vt += samples[GetNPID(index) + PADDED_X*o      ] * -2.0;
+    vt += samples[GetNPID(index) + PADDED_X*o+o    ] * -1.0;
+
+    float4 sobel = sqrt(hr * hr + vt * vt);
+
+    result = sobel;
+
+    // ---------------------------------------------------------------------------------------------
+    // DEBUG VISUALIZATION
+
+    // SV_DispatchThreadID - An unique identifier for each thread within the entire dispatch call.
+    if (_VisualizeDispatchThreadID)
+    {
+        result = 0;
+        result.r = DispatchThreadID.x / (float) xDim;
+        result.g = DispatchThreadID.y / (float) yDim;
+        if (DispatchThreadID.x == 0 && DispatchThreadID.y == 0)
+        {
+            result.rgb = float3(1,1,1);
+        }
+        if (DispatchThreadID.x == xDim - 1 && DispatchThreadID.y == yDim - 1)
+        {
+            result.rgb = float3(0,0,0);
+        }
+    }
+    // SV_GroupID - To which group the thread belongs to in the dispatch call.
+    if (_VisualizeGroupID)
+    {
+        result = 0;
+        result.r = GroupID.x / (float) THREADS_X;
+        result.g = GroupID.y / (float) THREADS_Y;
+    }
+    // SV_GroupThreadID - identifier for the thread inside the thread's own group.
+    if (_VisualizeGroupThreadID)
+    {
+        result = 0;
+        result.r = GroupThreadID.x / (float) THREADS_X;
+        result.g = GroupThreadID.y / (float) THREADS_Y;
+        if (GroupThreadID.x == 0 && GroupThreadID.y == 0)
+        {
+            result.rgb = float3(1,1,1);
+        }
+        if (GroupThreadID.x == THREADS_X - 1 && GroupThreadID.y == THREADS_Y - 1)
+        {
+            result.rgb = float3(0,0,0);
+        }
+    }
+    // SV_GroupIndex - "flattened" 1D index of a compute shader thread within it's thread group.
+    if (_VisualizeGroupIndex)
+    {
+        result = 0;
+        result.rgb = (float) GroupIndex / (float) (THREADS_X * THREADS_Y);
+
+        if (GroupIndex == 0)
+        {
+            result.rgb = float3(1,0,0);
+        }
+        if (GroupIndex == (THREADS_X * THREADS_Y - 1))
+        {
+            result.rgb = float3(0,1,0);
+        }
+    }
+
+
+    // ---------------------------------------------------------------------------------------------
+    // RESULT
+
+    ResultTexture[DispatchThreadID.xy] = result.rgba;
+};
