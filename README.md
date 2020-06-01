@@ -20,3 +20,5 @@ I created a Sobel convolution filter as a test visualization to see if texture l
 - Built in Unity 2018.4, most likely works on later versions
 - This implementation assumes a square image
 - Verbose comments in the code in case you find this interesting...
+
+© 2020 Olli Sorjonen All Rights Reserved
